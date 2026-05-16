@@ -1,5 +1,4 @@
-# stategy.py
-
+# strategy.py
 
 import time
 import pandas as pd
@@ -83,8 +82,12 @@ def save_strategy_positions(symbol, state):
         json.dump(data, f, indent=2, default=str)
 
 def recalculate_targets_v2(state, orders, grid_step, breakeven_buffer):
+    """
+    Расчёт целевых цен выхода для открытых ордеров.
+    """
     open_orders = [o for o in orders if o.get('status') == 'open']
     if not open_orders: return
+    
     state['max_sig_num'] = max(o.get('sig_num', 0) for o in open_orders)
     unique_entries = sorted(list(set(round(o['entry_price'], 4) for o in open_orders)))
     current_n = len(unique_entries)
@@ -98,19 +101,18 @@ def recalculate_targets_v2(state, orders, grid_step, breakeven_buffer):
 
     if state.get('strat_targets_frozen', False): return
 
-    # 1️⃣ Сначала рассчитываем цели
     for o in open_orders:
         if o.get('exit_logic') == 'breakeven':
             o['target_price'] = calc_breakeven_exit(o, state, state)
-    calc_cascade_exit(state, orders, grid_step)
-
-    # 2️⃣ Единое правило видимости: "если +шаг=1 И НЕ (max/крайняя)" → показать
+        elif o.get('exit_logic') == 'cascade':
+            o['target_price'] = None
+            o['plan_exit'] = None
+    
     for o in open_orders:
-        hide_plan = o.get('is_last_step', False) or (o.get('sig_num') == state['max_sig_num'])
-        has_plus_step = o.get('exit_allowed', False)  # Это и есть ваш "+шаг=1"
-        plan = o.get('target_price')
-
-        o['plan_exit'] = plan if plan and has_plus_step and not hide_plan else None
+        if o.get('exit_logic') == 'cascade':
+            o['plan_exit'] = None
+            o['target_price'] = None
+            o['exit_allowed'] = False
 
 def setup_symbol_context(state, symbol, current_price=None):
     coin = symbol.replace('USDT', '').lower()
@@ -176,18 +178,14 @@ def execute_long_entry(state, price, symbol, current_idx=-1, timestamp=None):
     sig_num = state.get('next_signal_num', 1)
     be_val = round(entry_p + state.get('strat_breakeven_buffer', 0.05), 2)
 
-
-    # 🔒 Фиксируем якорь (start_price_{coin}) как стартовую цену для этого ордера
     coin_upper = symbol.replace('USDT', '').upper()
     anchor = state.get(f'start_price_{coin_upper}')
     if anchor is None:
         anchor = entry_p
     frozen_base = anchor
 
-    frozen_plan_buy = price   # цена входа и есть план покупки для этой сделки
+    frozen_plan_buy = price
 
-
-    # (отладочный вывод можно оставить или убрать)
     print(f"DEBUG: entry_p={entry_p}, anchor={anchor}, frozen_base={frozen_base}")
 
     for logic in ['breakeven', 'cascade']:
@@ -207,9 +205,9 @@ def execute_long_entry(state, price, symbol, current_idx=-1, timestamp=None):
             'entry_timestamp': current_ts_seconds,
             'candle_idx': current_idx,
             'frozen_be_price': be_val,
-            'is_last_step': False,  # ❌ БЫЛО: True. Ставим False, чтобы не блокировать расчёт для всех сигналов
+            'is_last_step': False,
             'volume_mult': vol_mult,
-            'frozen_start_price': frozen_base,  # 🔒 СТАРТ ЦЕНА ЗАМОРОЖЕНА НАВЕЧНО
+            'frozen_start_price': frozen_base,
             'frozen_plan_buy': frozen_plan_buy,    
         })
 
@@ -229,7 +227,6 @@ def run_strategy_cycle(state, df, symbol, api_key, api_secret, is_simulation=Fal
     for o in orders:
         if not isinstance(o, dict):
             continue
-        # Если план уже заморожен, не зануляем его принудительно
         is_frozen = o.get('plan_exit_frozen', False)
         for k in ['plan_exit', 'target_price', 'exit_allowed', 'is_new', 'up_profit_flag', 'cascade_4_flag']:
             if is_frozen and k == 'plan_exit':
@@ -248,15 +245,13 @@ def run_strategy_cycle(state, df, symbol, api_key, api_secret, is_simulation=Fal
     row = df.iloc[last_closed_idx]
     open_p, close_p, low_p, high_p = float(row['open']), float(row['close']), float(row['low']), float(row['high'])
 
-    # Подготовка списков
+    # Исправлена ошибка синтаксиса (добвлено 'o for o in')
     open_orders = [o for o in orders if isinstance(o, dict) and o.get('status') == 'open']
     if not open_orders:
         state['strat_last_candle_idx'] = last_closed_idx
         return
 
-    # =================================================================
-    # 1️⃣ СНАЧАЛА ПРОВЕРКА ПРОДАЖИ по уже замороженным планам (low_p)
-    # =================================================================
+    # 1️⃣ ПРОВЕРКА ПРОДАЖИ
     for o in orders:
         if not isinstance(o, dict) or o.get('status') != 'open':
             continue
@@ -278,23 +273,20 @@ def run_strategy_cycle(state, df, symbol, api_key, api_secret, is_simulation=Fal
                     continue
 
             o['status'] = 'closed'
-            o['exit_price'] = close_p
+            o['exit_price'] = plan_exit if is_simulation else close_p
             o['exit_candle_idx'] = last_closed_idx
             o['exit_timestamp'] = row.get('timestamp', pd.Timestamp.now())
-            trade_pnl = (close_p - o['entry_price']) * (volume_usdt / o['entry_price'])
+            trade_pnl = (o['exit_price'] - o['entry_price']) * (volume_usdt / o['entry_price'])
             o['pnl'] = trade_pnl
             state['strat_total_realized_pnl'] += trade_pnl
-            add_log(f"📉 EXIT {o['exit_logic'].upper()} | Price: {close_p:.2f} | PnL: {trade_pnl:+.2f}$", state=state)
+            add_log(f"📉 EXIT {o['exit_logic'].upper()} | Price: {o['exit_price']:.2f} | PnL: {trade_pnl:+.2f}$", state=state)
             log_trade_to_file({
                 'datetime': pd.Timestamp.now(), 'action': 'SELL', 'symbol': symbol,
-                'price': close_p, 'amount_usd': volume_usdt, 'order_id': o.get('order_id'), 'status': 'closed'
+                'price': o['exit_price'], 'amount_usd': volume_usdt, 'order_id': o.get('order_id'), 'status': 'closed'
             })
             state['strat_exits_this_candle'] = True
 
-    # =================================================================
-    # 2️⃣ ПОТОМ АКТИВАЦИЯ НОВЫХ ПЛАНОВ (только для breakeven, не замороженных)
-    # =================================================================
-    # Пересчитываем максимумы после возможных продаж
+    # 2️⃣ АКТИВАЦИЯ НОВЫХ ПЛАНОВ
     open_orders_now = [o for o in orders if isinstance(o, dict) and o.get('status') == 'open']
     max_entry_now = max((o['entry_price'] for o in open_orders_now), default=0)
     max_sig_now = max((o.get('sig_num', 0) for o in open_orders_now), default=0)
@@ -302,9 +294,15 @@ def run_strategy_cycle(state, df, symbol, api_key, api_secret, is_simulation=Fal
     for o in orders:
         if not isinstance(o, dict) or o.get('status') != 'open':
             continue
+        if o.get('exit_logic') == 'cascade':
+            o['plan_exit'] = None
+            o['target_price'] = None
+            o['plan_exit_frozen'] = False
+            o['exit_allowed'] = False
+            continue
+        
         if o.get('exit_logic') != 'breakeven':
             continue
-        # Уже замороженный план не трогаем
         if o.get('plan_exit_frozen', False):
             continue
 
@@ -312,31 +310,28 @@ def run_strategy_cycle(state, df, symbol, api_key, api_secret, is_simulation=Fal
         if entry_p is None:
             continue
 
-        # Глобальный блокировщик: максимальная и крайняя сделка не получают план
         is_max_price = (entry_p == max_entry_now)
         is_last_purchase = (o.get('sig_num') == max_sig_now)
         if is_max_price and is_last_purchase:
             o['plan_exit'] = None
             o['plan_exit_frozen'] = False
+            o['exit_allowed'] = False
             continue
 
-        # Условие активации: цена закрытия достигла entry_p + grid_step (+шаг)
         if close_p >= entry_p + grid_step:
-            target = round(entry_p + breakeven_buffer, 2)   # ✅ правильная формула
+            target = round(entry_p + breakeven_buffer, 2)
             o['plan_exit'] = target
-            o['plan_exit_frozen'] = True                    # 🔒 вечная заморозка
-            add_log(f"🔒 PLAN EXIT #{o.get('sig_num')}: {target:.2f} (вход {entry_p:.2f} + буфер {breakeven_buffer})", state=state)
+            o['target_price'] = target
+            o['plan_exit_frozen'] = True
+            o['exit_allowed'] = True
+            add_log(f"🔒 PLAN EXIT #{o.get('sig_num')}: {target:.2f} (вход {entry_p:.2f} + буфер {breakeven_buffer}) | +Шаг выполнен", state=state)
         else:
             o['plan_exit'] = None
+            o['target_price'] = None
             o['plan_exit_frozen'] = False
+            o['exit_allowed'] = False
 
-    # Сохраняем индекс последней обработанной свечи
     state['strat_last_candle_idx'] = last_closed_idx
-    
-
-
-
-
 
 def process_entry_on_candle_close(state, closed_candle, symbol):
     if closed_candle is None: return
@@ -361,6 +356,8 @@ def process_entry_on_candle_close(state, closed_candle, symbol):
         state['strat_last_buy_price'] = start_price
 
     rev_limit = start_price * (1 - rev_threshold / 100)
+    
+    # --- ЛОГИКА РАЗВОРОТА (2 ШАГА) ---
     if close_p <= rev_limit and not state.get('strat_waiting_for_reversal', False):
         state['strat_waiting_for_reversal'] = True
         state['strat_bottom_price'] = close_p
@@ -368,29 +365,43 @@ def process_entry_on_candle_close(state, closed_candle, symbol):
         return
 
     enter_price = None
+    
     if state.get('strat_waiting_for_reversal', False):
+        # Мы в режиме ожидания разворота после просадки
+        # ... внутри if state.get('strat_waiting_for_reversal', False):
         bottom = state.get('strat_bottom_price', start_price)
+        
+        # Обновляем дно, если цена пошла еще ниже
         if close_p < bottom:
             state['strat_bottom_price'] = close_p
+        
+        # Вход только при пробое Дна + 2 ШАГА
         elif close_p >= bottom + (2 * grid_step):
             enter_price = bottom + (2 * grid_step)
             state['strat_waiting_for_reversal'] = False
-            add_log(f"🚀 РАЗВОРОТ! Вход по {enter_price:.2f}", state=state)
+            add_log(f"🚀 РАЗВОРОТ! Вход по {enter_price:.2f} (Дно {bottom:.2f} + 2 шага)", state=state)
 
-
-        # ------ ЛОГИКА ПОСЛЕ ПРОСАДКИ (ПРАВИЛО 4 ИЗ ЗАЩИЩЁННОГО БЛОКА) ------
-        # Определяем минимальную цену входа среди открытых позиций
+    # --- ЛОГИКА ТРЕНДА / БОКОВИКА (1 ШАГ ОТ МАКСИМУМА) ---
     else:
+        # ------ ИСПРАВЛЕННАЯ ЛОГИКА ПОСЛЕ ПРОСАДКИ ------
         open_ords = [o for o in state.get('strat_orders', []) if o.get('status') == 'open']
-        min_entry = min((o['entry_price'] for o in open_ords), default=float('inf'))
+        
+        # Находим минимальную цену входа среди открытых, чтобы понять контекст
+        min_entry_open = min((o['entry_price'] for o in open_ords), default=float('inf'))
+        max_entry_open = max((o['entry_price'] for o in open_ords), default=0)
 
-        if start_price < min_entry - 0.01:
+        # Сценарий А: Якорь (минимум цены) обновился и стал ниже всех открытых позиций (или позиций нет)
+        # В этом случае следующая покупка должна быть строго через 2 шага от НОВОГО дна (start_price)
+        if not open_ords or start_price < min_entry_open - 0.01:
             plan_price = start_price + (2 * grid_step)
-            add_log(f"📉 Просадка до {start_price:.2f}, первая покупка через 2 шага = {plan_price:.2f}", state=state)
+            add_log(f"📉 Просадка! Новое дно {start_price:.2f}. План входа: +2 шага = {plan_price:.2f}", state=state)
+        
+        # Сценарий Б: Мы растем от последнего входа (обычный тренд)
+        # Покупаем через 1 шаг от последней совершенной покупки
         else:
-            last_buy = state.get('strat_last_buy_price', start_price)
+            last_buy = state.get('strat_last_buy_price', max_entry_open)
             plan_price = last_buy + grid_step
-            add_log(f"📈 Тренд, шаг 1 от {last_buy:.2f} -> {plan_price:.2f}", state=state)
+            add_log(f"📈 Тренд. Последняя покупка {last_buy:.2f}. План входа: +1 шаг = {plan_price:.2f}", state=state)
 
         # 🛡 ПРОВЕРКА НА ПОВТОРЯЕМОСТЬ (НАЛОЖЕНИЕ С ОТКРЫТЫМИ ПОЗИЦИЯМИ)
         # Если план попадает в зону существующего входа, последовательно сдвигаем его вверх
@@ -407,37 +418,23 @@ def process_entry_on_candle_close(state, closed_candle, symbol):
             enter_price = plan_price
             add_log(f"📈 Вход по {enter_price:.2f}", state=state)
 
-
-# ---------------------------------------------------------------------------------------- 
-
-
+    # ИСПОЛНЕНИЕ ОРДЕРА
     if enter_price and not state.get('strat_entry_made_this_candle', False):
         last_idx = state.get('strat_last_candle_idx', -1)
         execute_long_entry(state, enter_price, symbol, current_idx=last_idx, timestamp=candle_ts)
         
-        # 🔒 База для плановых строк = цена только что открытой сделки
+        # Обновляем последнюю цену покупки и якорь
         state['strat_last_buy_price'] = enter_price
-        
-
-        # ========= ПРАВИЛО 3: всегда обновляем якорь до цены входа после покупки =========
-        coin = symbol.replace('USDT', '').upper()
         state[f'start_price_{coin}'] = enter_price
         print(f"🔁 ANCHOR FORCED UPDATE: {coin} -> {enter_price}")
-            # add_log(f"⚓ Якорь обновлён до цены входа {enter_price:.2f}", state=state)
-        # ====================================================================
         
         state['strat_entry_made_this_candle'] = True
 
-
-
 def calc_breakeven_exit(order, state, config):
-    # Берём буфер из state/config (приоритет 5.0, как в config.py)
     buffer = (config.get('strat_breakeven_buffer') or state.get('strat_breakeven_buffer')) or 5.0
-    
     if order.get('entry_price'):
-        # ✅ ИСПРАВЛЕНО: План = Цена ВХОДА + Breakeven Buffer (а не start_price и не grid_step)
         plan = round(order['entry_price'] + buffer, 2)
-        order['frozen_plan_exit'] = plan  # 🔒 Кеш для таблицы
+        order['frozen_plan_exit'] = plan
         return plan
     return None
 
